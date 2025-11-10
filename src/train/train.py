@@ -226,9 +226,19 @@ def train_epoch(model, dataloader, optimizer, criterion, device):
 
 
 def evaluate(model, dataloader, criterion, device):
-    """Evaluate model on validation/test set."""
+    """Evaluate model on validation/test set.
+    
+    Returns:
+        dict: Dictionary containing:
+            - 'loss': Mean squared error loss
+            - 'positional_error': Mean Euclidean distance error for positions (in meters)
+            - 'angular_error': Mean angular error for orientations (in degrees)
+    """
     model.eval()
     total_loss = 0.0
+    total_positional_error = 0.0
+    total_angular_error = 0.0
+    total_valid_frames = 0
     num_batches = 0
     
     with torch.no_grad():
@@ -242,14 +252,56 @@ def evaluate(model, dataloader, criterion, device):
             # Compute loss (only on non-padded frames)
             valid_mask = (pose.abs().sum(dim=-1) > 1e-6)  # (batch, seq_len)
             if valid_mask.sum() > 0:
-                loss = criterion(output[valid_mask], pose[valid_mask])
+                # Extract valid predictions and ground truth
+                valid_output = output[valid_mask]  # (N_valid, 7)
+                valid_pose = pose[valid_mask]      # (N_valid, 7)
+                
+                # Compute MSE loss
+                loss = criterion(valid_output, valid_pose)
+                total_loss += loss.item()
+                
+                # Compute positional error (Euclidean distance for first 3 dimensions)
+                pred_pos = valid_output[:, :3]  # (N_valid, 3)
+                gt_pos = valid_pose[:, :3]      # (N_valid, 3)
+                positional_errors = torch.norm(pred_pos - gt_pos, dim=1)  # (N_valid,)
+                total_positional_error += positional_errors.sum().item()
+                
+                # Compute angular error (angle between quaternions)
+                pred_quat = valid_output[:, 3:]  # (N_valid, 4) [x, y, z, w]
+                gt_quat = valid_pose[:, 3:]      # (N_valid, 4) [x, y, z, w]
+                
+                # Normalize quaternions
+                pred_quat = pred_quat / (torch.norm(pred_quat, dim=1, keepdim=True) + 1e-8)
+                gt_quat = gt_quat / (torch.norm(gt_quat, dim=1, keepdim=True) + 1e-8)
+                
+                # Compute dot product (clamp to [-1, 1] for numerical stability)
+                dot_product = torch.clamp(torch.sum(pred_quat * gt_quat, dim=1), -1.0, 1.0)
+                
+                # Angular error in radians (using 2 * arccos(|dot|) for quaternion distance)
+                # We use absolute value to handle quaternion double-cover (q and -q represent same rotation)
+                angular_errors_rad = 2 * torch.acos(torch.abs(dot_product))
+                
+                # Convert to degrees
+                angular_errors_deg = torch.rad2deg(angular_errors_rad)
+                total_angular_error += angular_errors_deg.sum().item()
+                
+                total_valid_frames += valid_mask.sum().item()
             else:
                 loss = torch.tensor(0.0, device=device, requires_grad=False)
+                total_loss += loss.item()
             
-            total_loss += loss.item()
             num_batches += 1
     
-    return total_loss / num_batches if num_batches > 0 else 0.0
+    # Compute averages
+    avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+    avg_positional_error = total_positional_error / total_valid_frames if total_valid_frames > 0 else 0.0
+    avg_angular_error = total_angular_error / total_valid_frames if total_valid_frames > 0 else 0.0
+    
+    return {
+        'loss': avg_loss,
+        'positional_error': avg_positional_error,
+        'angular_error': avg_angular_error
+    }
 
 
 def plot_training_curves(train_losses, dev_losses, save_path="training_curves.png"):
@@ -278,19 +330,26 @@ def plot_training_curves(train_losses, dev_losses, save_path="training_curves.pn
     plt.close()
 
 
-def save_training_history(train_losses, dev_losses, test_loss, save_path="training_history.json"):
+def save_training_history(train_losses, dev_losses, dev_positional_errors, dev_angular_errors, 
+                         test_metrics, save_path="training_history.json"):
     """Save training history to JSON file.
     
     Args:
         train_losses: List of training losses per epoch
         dev_losses: List of validation losses per epoch
-        test_loss: Final test loss
+        dev_positional_errors: List of validation positional errors per epoch
+        dev_angular_errors: List of validation angular errors per epoch
+        test_metrics: Dictionary with test set metrics
         save_path: Path to save the JSON file
     """
     history = {
         "train_losses": train_losses,
         "dev_losses": dev_losses,
-        "test_loss": test_loss,
+        "dev_positional_errors": dev_positional_errors,
+        "dev_angular_errors": dev_angular_errors,
+        "test_loss": test_metrics['loss'],
+        "test_positional_error": test_metrics['positional_error'],
+        "test_angular_error": test_metrics['angular_error'],
         "num_epochs": len(train_losses),
         "timestamp": datetime.now().isoformat()
     }
@@ -369,6 +428,8 @@ def main():
     # Track training history
     train_losses = []
     dev_losses = []
+    dev_positional_errors = []
+    dev_angular_errors = []
     
     # Training loop
     print("Starting training...")
@@ -376,44 +437,56 @@ def main():
     
     for epoch in tqdm(range(num_epochs)):
         train_loss = train_epoch(model, train_loader, optimizer, criterion, device)
-        dev_loss = evaluate(model, dev_loader, criterion, device)
+        dev_metrics = evaluate(model, dev_loader, criterion, device)
         
         # Track history
         train_losses.append(train_loss)
-        dev_losses.append(dev_loss)
+        dev_losses.append(dev_metrics['loss'])
+        dev_positional_errors.append(dev_metrics['positional_error'])
+        dev_angular_errors.append(dev_metrics['angular_error'])
         
         # Log to wandb if available
         if WANDB_AVAILABLE:
             wandb.log({
                 "epoch": epoch + 1,
                 "train_loss": train_loss,
-                "dev_loss": dev_loss,
+                "dev_loss": dev_metrics['loss'],
+                "dev_positional_error": dev_metrics['positional_error'],
+                "dev_angular_error": dev_metrics['angular_error'],
             })
         
         print(f"Epoch {epoch+1}/{num_epochs}")
         print(f"  Train Loss: {train_loss:.6f}")
-        print(f"  Dev Loss: {dev_loss:.6f}")
+        print(f"  Dev Loss: {dev_metrics['loss']:.6f}")
+        print(f"  Dev Positional Error: {dev_metrics['positional_error']:.4f} m")
+        print(f"  Dev Angular Error: {dev_metrics['angular_error']:.4f}°")
         
         # Save best model
-        if dev_loss < best_dev_loss:
-            best_dev_loss = dev_loss
+        if dev_metrics['loss'] < best_dev_loss:
+            best_dev_loss = dev_metrics['loss']
             torch.save(model.state_dict(), "best_model.pth")
-            print(f"  Saved best model (dev loss: {dev_loss:.6f})")
+            print(f"  Saved best model (dev loss: {dev_metrics['loss']:.6f})")
         print()
     
     # Evaluate on test set
     print("Evaluating on test set...")
     model.load_state_dict(torch.load("best_model.pth"))
-    test_loss = evaluate(model, test_loader, criterion, device)
-    print(f"Test Loss: {test_loss:.6f}")
+    test_metrics = evaluate(model, test_loader, criterion, device)
+    print(f"Test Loss: {test_metrics['loss']:.6f}")
+    print(f"Test Positional Error: {test_metrics['positional_error']:.4f} m")
+    print(f"Test Angular Error: {test_metrics['angular_error']:.4f}°")
     
-    # Log test loss to wandb
+    # Log test metrics to wandb
     if WANDB_AVAILABLE:
-        wandb.log({"test_loss": test_loss})
+        wandb.log({
+            "test_loss": test_metrics['loss'],
+            "test_positional_error": test_metrics['positional_error'],
+            "test_angular_error": test_metrics['angular_error'],
+        })
         wandb.finish()
     
     # Save training history and plot curves
-    save_training_history(train_losses, dev_losses, test_loss)
+    save_training_history(train_losses, dev_losses, dev_positional_errors, dev_angular_errors, test_metrics)
     plot_training_curves(train_losses, dev_losses)
 
 
