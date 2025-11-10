@@ -9,6 +9,16 @@ import json
 from scipy.io import wavfile
 import numpy as np
 from tqdm import tqdm
+import matplotlib.pyplot as plt
+from datetime import datetime
+
+# Try to import wandb, but make it optional
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    print("Warning: wandb not available. Install with 'pip install wandb' for experiment tracking.")
 
 # Import model components
 import sys
@@ -242,6 +252,55 @@ def evaluate(model, dataloader, criterion, device):
     return total_loss / num_batches if num_batches > 0 else 0.0
 
 
+def plot_training_curves(train_losses, dev_losses, save_path="training_curves.png"):
+    """Plot training and validation loss curves.
+    
+    Args:
+        train_losses: List of training losses per epoch
+        dev_losses: List of validation losses per epoch
+        save_path: Path to save the plot
+    """
+    plt.figure(figsize=(10, 6))
+    epochs = range(1, len(train_losses) + 1)
+    
+    plt.plot(epochs, train_losses, 'b-', label='Train Loss', linewidth=2, marker='o')
+    plt.plot(epochs, dev_losses, 'r-', label='Dev Loss', linewidth=2, marker='s')
+    
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('Loss', fontsize=12)
+    plt.title('Training and Validation Loss', fontsize=14, fontweight='bold')
+    plt.legend(fontsize=11)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"Training curves saved to {save_path}")
+    plt.close()
+
+
+def save_training_history(train_losses, dev_losses, test_loss, save_path="training_history.json"):
+    """Save training history to JSON file.
+    
+    Args:
+        train_losses: List of training losses per epoch
+        dev_losses: List of validation losses per epoch
+        test_loss: Final test loss
+        save_path: Path to save the JSON file
+    """
+    history = {
+        "train_losses": train_losses,
+        "dev_losses": dev_losses,
+        "test_loss": test_loss,
+        "num_epochs": len(train_losses),
+        "timestamp": datetime.now().isoformat()
+    }
+    
+    with open(save_path, 'w') as f:
+        json.dump(history, f, indent=2)
+    
+    print(f"Training history saved to {save_path}")
+
+
 def main():
     # Configuration
     data_root = Path("data/Main")
@@ -254,16 +313,13 @@ def main():
     test_sessions = [12]                  # Session 12
     
     # Model hyperparameters
-    hidden_dim = 128
+    hidden_dim = 32
     num_layers = 2
     dropout = 0.1
     batch_size = 4
     num_epochs = 10
     learning_rate = 1e-3
     
-    # Device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
     
     # Create datasets
     print("Loading datasets...")
@@ -292,6 +348,28 @@ def main():
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     
+    # Initialize wandb if available
+    if WANDB_AVAILABLE:
+        wandb.init(
+            project="audio-pose-prediction",
+            config={
+                "hidden_dim": hidden_dim,
+                "num_layers": num_layers,
+                "dropout": dropout,
+                "batch_size": batch_size,
+                "num_epochs": num_epochs,
+                "learning_rate": learning_rate,
+                "train_sessions": train_sessions,
+                "dev_sessions": dev_sessions,
+                "test_sessions": test_sessions,
+            }
+        )
+        wandb.watch(model)
+    
+    # Track training history
+    train_losses = []
+    dev_losses = []
+    
     # Training loop
     print("Starting training...")
     best_dev_loss = float('inf')
@@ -299,6 +377,18 @@ def main():
     for epoch in tqdm(range(num_epochs)):
         train_loss = train_epoch(model, train_loader, optimizer, criterion, device)
         dev_loss = evaluate(model, dev_loader, criterion, device)
+        
+        # Track history
+        train_losses.append(train_loss)
+        dev_losses.append(dev_loss)
+        
+        # Log to wandb if available
+        if WANDB_AVAILABLE:
+            wandb.log({
+                "epoch": epoch + 1,
+                "train_loss": train_loss,
+                "dev_loss": dev_loss,
+            })
         
         print(f"Epoch {epoch+1}/{num_epochs}")
         print(f"  Train Loss: {train_loss:.6f}")
@@ -316,6 +406,15 @@ def main():
     model.load_state_dict(torch.load("best_model.pth"))
     test_loss = evaluate(model, test_loader, criterion, device)
     print(f"Test Loss: {test_loss:.6f}")
+    
+    # Log test loss to wandb
+    if WANDB_AVAILABLE:
+        wandb.log({"test_loss": test_loss})
+        wandb.finish()
+    
+    # Save training history and plot curves
+    save_training_history(train_losses, dev_losses, test_loss)
+    plot_training_curves(train_losses, dev_losses)
 
 
 if __name__ == '__main__':
